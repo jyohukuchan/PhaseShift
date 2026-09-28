@@ -4,6 +4,7 @@
 #include <phaseshift/models/qwen35/runtime/executor.h>
 #include <phaseshift/models/qwen35/runtime/mtp_executor.h>
 #include <phaseshift/models/qwen35/runtime/scheduled_batch.h>
+#include <phaseshift/models/qwen35/runtime/spec_decoder.h>
 #include <phaseshift/models/qwen35/state/gdn_state_pool.h>
 #include <phaseshift/models/qwen35/state/paged_kv_pool.h>
 #include <phaseshift/models/qwen35/state/paged_sequence_state.h>
@@ -11,6 +12,7 @@
 #include <phaseshift/models/qwen35/weights/model_weights.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -31,12 +33,13 @@ void usage() {
         "  --draft-k N                  drafts per verify round (default 4)\n"
         "  --token-id N                 (default 1)\n"
         "  --tokens-file PATH           PSKLDTOK corpus used as the prompt\n"
-        "  --tokens-file PATH           PSKLDTOK corpus used as the prompt\n"
         "  --tokens-offset N            corpus position to start the prompt (default 0)\n"
-        "  --chain pre|post             hidden fed to draft step >=2 (default post)\n"
-        "  --spec                       run the real greedy draft/verify/accept loop\n"
+        "  --chain pre|post             draft hidden for step >=2 of the legacy sim (default post)\n"
+        "  --spec                       run the production SpecDecoder draft/verify/accept loop\n"
         "  --replay-check               replay prefix + sequential decode vs reference\n"
-        "  --spec-only                  skip the acceptance sim + verify-check phases\n"
+        "  --spec-only                  --spec and skip the acceptance sim + verify-check phases\n"
+        "  --spec-debug                 log MTP logical / RoPE / KV length transitions\n"
+        "  --verify-mode exact|fast     SpecDecoder verify numeric mode (default exact)\n"
         "  --page-tokens N              (default 16)\n");
 }
 
@@ -91,9 +94,12 @@ int run_mtp(int argc, char** argv) {
     std::string tokens_file;
     unsigned long tokens_offset = 0;
     bool chain_post = true;
+    bool chain_given = false;
     bool spec_mode = false;
     bool replay_check = false;
     bool spec_only = false;
+    bool spec_debug = false;
+    bool spec_exact = true;
     bool mrow_check = false;
     int vc_level = 3;
     unsigned long mrow_offset = 0;
@@ -117,10 +123,18 @@ int run_mtp(int argc, char** argv) {
         else if (a == "--page-tokens") { const char* v = next("--page-tokens"); if (!v || !parse_u32(v, page_tokens)) return 2; }
         else if (a == "--tokens-file") { const char* v = next("--tokens-file"); if (!v) return 2; tokens_file = v; }
         else if (a == "--tokens-offset") { const char* v = next("--tokens-offset"); if (!v || !parse_u32(v, tokens_offset)) return 2; }
-        else if (a == "--chain") { const char* v = next("--chain"); if (!v) return 2; chain_post = (std::strcmp(v, "post") == 0); }
-        else if (a == "--spec") { spec_mode = true; spec_only = true; }
+        else if (a == "--chain") { const char* v = next("--chain"); if (!v) return 2; chain_post = (std::strcmp(v, "post") == 0); chain_given = true; }
+        else if (a == "--spec") { spec_mode = true; }
         else if (a == "--replay-check") { replay_check = true; }
         else if (a == "--spec-only") { spec_mode = true; spec_only = true; }
+        else if (a == "--spec-debug") { spec_debug = true; }
+        else if (a == "--verify-mode") {
+            const char* v = next("--verify-mode");
+            if (!v) return 2;
+            if (std::strcmp(v, "exact") == 0) spec_exact = true;
+            else if (std::strcmp(v, "fast") == 0) spec_exact = false;
+            else { std::fprintf(stderr, "invalid --verify-mode: %s\n", v); return 2; }
+        }
         else if (a == "--mrow-check") { mrow_check = true; }
         else if (a == "--vc-level") { const char* v = next("--vc-level"); if (!v) return 2; vc_level = (int)strtol(v, nullptr, 10); }
         else if (a == "--mrow-offset") { const char* v = next("--mrow-offset"); if (!v || !parse_u32(v, mrow_offset)) return 2; }
@@ -936,213 +950,321 @@ int run_mtp(int argc, char** argv) {
         std::fflush(stdout);
     }
 
-    // ---- phase 4: real greedy speculative decode loop (draft -> verify -> accept) ----
+    // ---- phase 4: production SpecDecoder loop (prompt sync -> step) ----
     if (spec_mode && context < 1u) {
         std::fprintf(stderr, "--spec requires --context >= 1\n");
         return 2;
     }
+    if (spec_mode && steps < 1u) {
+        std::fprintf(stderr, "--spec requires --steps >= 1\n");
+        return 2;
+    }
+    bool spec_ok = true;
     if (spec_mode) {
-        std::printf("\n--- spec decode (K=%lu) ---\n", draft_k);
+        std::printf("\n--- spec decode (K=%lu) via SpecDecoder, verify=%s ---\n",
+                    draft_k, spec_exact ? "Exact" : "Fast");
+        std::printf("spec draft chain: hidden_out (pre-final-norm)\n");
+        if (chain_given && chain_post) {
+            std::printf("note: --chain selects the legacy acceptance-sim draft hidden only; "
+                        "the SpecDecoder path always chains hidden_out\n");
+        }
+
         ps::Status rst = rec_pool.reset(seq.slot, stream);
         if (!rst.ok()) {
             std::fprintf(stderr, "spec: gdn reset failed: %s\n", rst.message().c_str());
             return 1;
         }
         seq.position = 0u;
-
-        auto hid_alloc = arena.allocate_aligned(static_cast<std::size_t>(H) * sizeof(ps::bf16_t), 128);
-        if (!hid_alloc.ok()) {
-            std::fprintf(stderr, "spec hidden alloc failed\n");
+        ps::Status mrst = ps::qwen35::runtime::mtp_kv_reset(mtp.kv_state, stream);
+        if (!mrst.ok()) {
+            std::fprintf(stderr, "spec: mtp kv reset failed: %s\n", mrst.message().c_str());
             return 1;
         }
-        auto hb = hid_alloc.release();
-        auto ht = ps::gpu::Tensor::create<ps::bf16_t>(hb, {H}, {1});
-        if (!ht.ok()) {
-            std::fprintf(stderr, "spec hidden tensor failed\n");
+
+        ps::qwen35::ScheduledRequest preq;
+        preq.sequence = &seq;
+        preq.handle = seq.request_handle();
+        preq.execution_class = ps::runtime::ExecutionClass::PREFILL;
+        preq.token_begin = 0;
+        preq.num_tokens = static_cast<uint32_t>(context);
+        preq.prefix_tokens = seq.position;
+        preq.compute_logits = true;
+        preq.sample = true;
+        preq.num_output_rows = 1u;
+        std::vector<ps::qwen35::ScheduledRequest> preqs = {preq};
+        ps::qwen35::ScheduledBatch pbatch;
+        pbatch.token_ids = prompt.data();
+        pbatch.requests = preqs;
+        pbatch.num_tokens = static_cast<uint32_t>(context);
+        pbatch.num_requests = 1;
+        pbatch.num_prefill_requests = 1;
+
+        auto pres = ps::qwen35::execute_batch(executor, pbatch, stream);
+        if (!pres.ok()) {
+            std::fprintf(stderr, "spec prompt prefill failed: %s\n",
+                         pres.status().message().c_str());
             return 1;
         }
-        auto spec_h = ht.release();
-        ps::bf16_t* hlast = spec_h.data<ps::bf16_t>();
+        ps::qwen35::BatchExecutionOutput pout = pres.release();
+        if (pout.num_outputs != 1u || pout.num_token_rows != static_cast<uint32_t>(context)) {
+            std::fprintf(stderr, "spec prompt prefill: rows=%u outputs=%u\n",
+                         pout.num_token_rows, pout.num_outputs);
+            return 1;
+        }
+        int32_t first = -1;
+        if (hipMemcpy(&first, pout.sampled_tokens.data<int32_t>(), sizeof(int32_t),
+                      hipMemcpyDeviceToHost) != hipSuccess) {
+            std::fprintf(stderr, "spec prompt sample copy failed\n");
+            return 1;
+        }
+        const int32_t reference_first = tokens[static_cast<std::size_t>(context)];
+        if (first != reference_first) {
+            std::fprintf(stderr, "spec prompt prefill mismatch: got %d expected %d\n",
+                         first, reference_first);
+            return 1;
+        }
+        const ps::bf16_t* prompt_hidden = pout.token_hidden.data<ps::bf16_t>();
+        if (prompt_hidden == nullptr) {
+            std::fprintf(stderr, "spec prompt prefill produced no token hidden\n");
+            return 1;
+        }
 
-        auto run_one = [&](const int32_t* toks, uint32_t nt, uint32_t nout,
-                           bool logits, ps::qwen35::BatchExecutionOutput* dst) -> bool {
-            ps::qwen35::ScheduledRequest req;
-            req.sequence = &seq;
-            req.handle = seq.request_handle();
-            req.execution_class = ps::runtime::ExecutionClass::PREFILL;
-            req.token_begin = 0;
-            req.num_tokens = nt;
-            req.prefix_tokens = seq.position;
-            req.compute_logits = logits;
-            req.sample = logits;
-            req.num_output_rows = nout;
-            std::vector<ps::qwen35::ScheduledRequest> reqs = {req};
-            ps::qwen35::ScheduledBatch batch;
-            batch.token_ids = toks;
-            batch.requests = reqs;
-            batch.num_tokens = nt;
-            batch.num_requests = 1;
-            batch.num_decode_requests = 0;
-            batch.num_verify_requests = 0;
-            batch.num_prefill_requests = 1;
-            auto res = ps::qwen35::execute_batch(executor, batch, stream);
-            if (!res.ok()) {
-                std::fprintf(stderr, "spec forward failed: %s\n", res.status().message().c_str());
-                return false;
-            }
-            if (dst != nullptr) *dst = std::move(res.release());
-            else (void)res.release();
-            return true;
+        ps::qwen35::runtime::SpecDecoderConfig spec_config;
+        spec_config.num_drafts = static_cast<uint32_t>(draft_k);
+        spec_config.bonus_token_enabled = true;
+        spec_config.eos_token = -1;
+        spec_config.verify_numeric_mode =
+            spec_exact ? ps::runtime::VerifyNumericMode::Exact
+                       : ps::runtime::VerifyNumericMode::Fast;
+        spec_config.draft_policy = ps::qwen35::runtime::MtpDraftPolicy{};
+
+        auto decoder_result = ps::qwen35::runtime::create_spec_decoder(
+            executor, mtp, mtp.kv_state, seq, rec_pool, arena, spec_config, stream);
+        if (!decoder_result.ok()) {
+            std::fprintf(stderr, "create_spec_decoder failed: %s\n",
+                         decoder_result.status().message().c_str());
+            return 1;
+        }
+        ps::qwen35::runtime::SpecDecoder decoder = decoder_result.release();
+        ps::qwen35::runtime::SpecDecoderTiming timing;
+        decoder.timing = &timing;
+
+        auto sync = ps::qwen35::runtime::spec_decoder_sync_prompt(
+            decoder, prompt.data(), prompt_hidden, static_cast<uint32_t>(context));
+        if (!sync.ok()) {
+            std::fprintf(stderr, "spec_decoder_sync_prompt failed: %s\n",
+                         sync.message().c_str());
+            return 1;
+        }
+        const uint32_t sync_expected = static_cast<uint32_t>(context) - 1u;
+        const uint32_t sync_actual = mtp.kv_state.logical_length;
+        std::printf("spec: prompt sync mtp.logical_length=%u expected=%u %s\n",
+                    sync_actual, sync_expected,
+                    sync_actual == sync_expected ? "OK" : "FAIL");
+        if (sync_actual != sync_expected) {
+            return 1;
+        }
+
+        struct SpecIterDiag {
+            int32_t pending_before = -1;
+            uint32_t mtp_length_before = 0u;
+            uint32_t seq_position_before = 0u;
+            uint32_t mtp_length_after = 0u;
+            uint32_t seq_position_after = 0u;
+            uint32_t accepted = 0u;
+            uint32_t drafts = 0u;
+            uint32_t mtp_drafts = 0u;
+            bool rerun = false;
+            std::vector<int32_t> draft_tokens;
+            std::vector<int32_t> verify_sampled;
+            std::vector<int32_t> emitted_tokens;
         };
 
-        ps::qwen35::BatchExecutionOutput pout;
-        if (!run_one(prompt.data(), static_cast<uint32_t>(context), 1u, true, &pout) ||
-            pout.num_outputs != 1u) {
-            return 1;
-        }
-        int32_t cur = -1;
-        if (hipMemcpy(&cur, pout.sampled_tokens.data<int32_t>(), sizeof(int32_t),
-                      hipMemcpyDeviceToHost) != hipSuccess) {
-            std::fprintf(stderr, "spec prefill sample copy failed\n");
-            return 1;
-        }
-        if (hipMemcpy(hlast, pout.final_hidden.data<void>(),
-                      static_cast<std::size_t>(H) * sizeof(ps::bf16_t),
-                      hipMemcpyDeviceToDevice) != hipSuccess) {
-            std::fprintf(stderr, "spec prefill hidden copy failed\n");
-            return 1;
-        }
-
-        uint32_t P = static_cast<uint32_t>(context) - 1u;
         std::vector<int32_t> emitted;
-        std::vector<int32_t> vtok(draft_k + 1u);
-        std::vector<int32_t> vsamp(draft_k + 1u);
-        std::vector<uint32_t> drafts(draft_k);
+        emitted.reserve(static_cast<std::size_t>(steps));
+        int32_t pending = first;
+        SpecIterDiag bad_diag;
+        int first_bad = -1;
+        bool contract_ok = true;
+
         long long rounds = 0;
-        long long reruns = 0;
-        long long sum_accept = 0;
+        long long accepted_total = 0;
+        long long drafts_total = 0;
+        long long reject0 = 0;
+        long long full_accepts = 0;
+        long long rerun_count = 0;
+        long long single_decodes = 0;
 
-        auto t0 = std::chrono::steady_clock::now();
-        while (emitted.size() < steps) {
-            ps::bf16_t* hid = hlast;
-            int32_t in_tok = cur;
-            for (uint32_t k = 0; k < draft_k; ++k) {
-                auto dr = ps::qwen35::runtime::run_mtp_head(
-                    mtp, hid, in_tok, P + k, stream);
-                if (!dr.ok()) {
-                    std::fprintf(stderr, "spec draft failed at pos %u: %s\n", P + k,
-                                 dr.status().message().c_str());
-                    return 1;
-                }
-                drafts[k] = dr.value();
-                if (rounds == 0 && k == 0u) {
-                    std::vector<float> lg(8, 0.f);
-                    if (hipMemcpy(lg.data(), mtp.logits.data<float>(), lg.size() * sizeof(float),
-                                  hipMemcpyDeviceToHost) != hipSuccess) {
-                        std::fprintf(stderr, "spec debug copy failed\n");
-                        return 1;
-                    }
-                    std::printf("  dbg draft0 pos=%u tok=%d logits[0..7]=", P, in_tok);
-                    for (uint32_t z = 0; z < lg.size(); ++z) std::printf(" %.3f", lg[z]);
-                    std::printf(" -> %u\n", drafts[k]);
-                    std::fflush(stdout);
-                }
-                hid = chain_post ? mtp.hidden_out_normed.data<ps::bf16_t>()
-                                 : mtp.hidden_out.data<ps::bf16_t>();
-                in_tok = static_cast<int32_t>(drafts[k]);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (emitted.size() < static_cast<std::size_t>(steps) && pending >= 0) {
+            SpecIterDiag diag;
+            diag.pending_before = pending;
+            diag.mtp_length_before = mtp.kv_state.logical_length;
+            diag.seq_position_before = seq.position;
+            if (spec_debug) {
+                std::printf("spec: draft start seq.position=%u abs_rope=%u "
+                            "mtp.logical_length=%u pending=%d\n",
+                            seq.position, seq.position - 1u,
+                            mtp.kv_state.logical_length, pending);
             }
 
-            vtok[0] = cur;
-            for (uint32_t k = 0; k < draft_k; ++k) vtok[k + 1u] = static_cast<int32_t>(drafts[k]);
-            ps::qwen35::BatchExecutionOutput vout;
-            if (!run_one(vtok.data(), static_cast<uint32_t>(draft_k) + 1u,
-                         static_cast<uint32_t>(draft_k) + 1u, true, &vout) ||
-                vout.num_outputs != static_cast<uint32_t>(draft_k) + 1u) {
+            auto stepped = ps::qwen35::runtime::spec_decoder_step(decoder, pending);
+            if (!stepped.ok()) {
+                std::fprintf(stderr, "spec_decoder_step failed at round %lld: %s\n",
+                             rounds, stepped.status().message().c_str());
                 return 1;
             }
-            if (hipMemcpy(vsamp.data(), vout.sampled_tokens.data<int32_t>(),
-                          vtok.size() * sizeof(int32_t), hipMemcpyDeviceToHost) != hipSuccess) {
-                std::fprintf(stderr, "spec verify sample copy failed\n");
-                return 1;
-            }
-
-            uint32_t a = 0;
-            while (a < draft_k && vsamp[a] == static_cast<int32_t>(drafts[a])) ++a;
-            if (rounds < 6) {
-                std::printf("  rnd%lld P=%u cur=%d drafts=", rounds, P, cur);
-                for (uint32_t k = 0; k < draft_k; ++k) std::printf(" %d", drafts[k]);
-                std::printf("  verify=");
-                for (uint32_t k = 0; k <= draft_k; ++k) std::printf(" %d", vsamp[k]);
-                std::printf("  accept=%u%s\n", a, a < draft_k ? " RERUN" : "");
-            }
-            const int32_t bonus = vsamp[a];
-            for (uint32_t k = 0; k < a; ++k) emitted.push_back(static_cast<int32_t>(drafts[k]));
-            emitted.push_back(bonus);
+            ps::qwen35::runtime::SpecIterationOutput out = stepped.release();
             ++rounds;
-            sum_accept += a;
+            if (out.emitted_tokens.empty()) {
+                std::fprintf(stderr, "spec: update %lld emitted no token\n", rounds);
+                return 1;
+            }
 
-            const uint32_t newP = P + 1u + a;
-            if (a == draft_k) {
-                const ps::bf16_t* row =
-                    vout.token_hidden.data<ps::bf16_t>() + static_cast<std::size_t>(a) * H;
-                if (hipMemcpy(hlast, row, static_cast<std::size_t>(H) * sizeof(ps::bf16_t),
-                              hipMemcpyDeviceToDevice) != hipSuccess) {
-                    std::fprintf(stderr, "spec hidden copy failed\n");
-                    return 1;
-                }
+            accepted_total += out.num_accepted_drafts;
+            drafts_total += out.num_drafts_generated;
+            if (out.num_drafts_generated == 0u) {
+                ++single_decodes;
             } else {
-                ++reruns;
-                seq.position = P + 1u;
-                ps::qwen35::BatchExecutionOutput rout;
-                if (!run_one(vtok.data(), a + 1u, 1u, true, &rout) || rout.num_outputs != 1u) {
-                    return 1;
-                }
-                if (hipMemcpy(hlast, rout.final_hidden.data<void>(),
-                              static_cast<std::size_t>(H) * sizeof(ps::bf16_t),
-                              hipMemcpyDeviceToDevice) != hipSuccess) {
-                    std::fprintf(stderr, "spec rerun hidden copy failed\n");
-                    return 1;
+                if (out.num_accepted_drafts == 0u) ++reject0;
+                if (out.num_accepted_drafts == out.num_drafts_generated) ++full_accepts;
+            }
+            if (out.rerun) ++rerun_count;
+
+            uint32_t mtp_kept = 0u;
+            if (out.num_mtp_drafts > 0u) {
+                mtp_kept = std::min(out.num_accepted_drafts + 1u, out.num_mtp_drafts);
+            }
+            const uint32_t expected_length = out.mtp_length_before + mtp_kept;
+            const uint32_t actual_length = mtp.kv_state.logical_length;
+            const bool length_ok = actual_length == expected_length &&
+                                   out.mtp_length_before == diag.mtp_length_before;
+            if (!length_ok) {
+                contract_ok = false;
+                std::fprintf(stderr,
+                             "spec: MTP length contract FAIL update=%lld before=%u "
+                             "expected=%u actual=%u step_start=%u accepted=%u "
+                             "drafts=%u mtp_drafts=%u\n",
+                             rounds, out.mtp_length_before, expected_length, actual_length,
+                             diag.mtp_length_before, out.num_accepted_drafts,
+                             out.num_drafts_generated, out.num_mtp_drafts);
+            }
+            if (spec_debug) {
+                std::printf(
+                    "spec: draft done kv_length_before=%u kv_length_after=%u "
+                    "accepted=%u drafts=%u rerun=%d length=%s\n",
+                    out.mtp_length_before, out.mtp_length_after,
+                    out.num_accepted_drafts, out.num_drafts_generated,
+                    out.rerun ? 1 : 0, length_ok ? "OK" : "FAIL");
+            }
+
+            diag.mtp_length_after = actual_length;
+            diag.seq_position_after = seq.position;
+            diag.accepted = out.num_accepted_drafts;
+            diag.drafts = out.num_drafts_generated;
+            diag.mtp_drafts = out.num_mtp_drafts;
+            diag.rerun = out.rerun;
+            diag.draft_tokens = out.draft_tokens;
+            diag.verify_sampled = out.verify_sampled;
+            diag.emitted_tokens = out.emitted_tokens;
+
+            const std::size_t begin_index = emitted.size();
+            for (int32_t t : out.emitted_tokens) emitted.push_back(t);
+            for (std::size_t i = begin_index; i < emitted.size(); ++i) {
+                if (i >= static_cast<std::size_t>(steps)) break;
+                const int32_t ref = tokens[static_cast<std::size_t>(context) + 1u + i];
+                if (emitted[i] != ref && first_bad < 0) {
+                    first_bad = static_cast<int>(i);
+                    bad_diag = diag;
                 }
             }
-            P = newP;
-            cur = bonus;
-        }
-        auto t1 = std::chrono::steady_clock::now();
-        const double spec_ms =
-            std::chrono::duration<double, std::milli>(t1 - t0).count() /
-            static_cast<double>(emitted.size());
 
+            pending = out.pending_token;
+            if (out.finished) break;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double wall_ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        const double rounds_d = rounds > 0 ? static_cast<double>(rounds) : 1.0;
+        const double emitted_d = static_cast<double>(emitted.size());
+        const std::size_t printed = std::min<std::size_t>(
+            std::min<std::size_t>(emitted.size(), 11u), static_cast<std::size_t>(steps));
         std::printf("reference (tokens[context+1+i]):");
-        for (uint32_t i = 0; i < 10u; ++i) {
+        for (std::size_t i = 0; i < printed; ++i) {
             std::printf(" %d", tokens[static_cast<std::size_t>(context) + 1u + i]);
         }
         std::printf("\nemitted                          :");
-        for (std::size_t i = 0; i < std::min<size_t>(emitted.size(), 11u); ++i) {
-            std::printf(" %d", emitted[i]);
-        }
+        for (std::size_t i = 0; i < printed; ++i) std::printf(" %d", emitted[i]);
         std::printf("\n");
 
-        int first_bad = -1;
-        const std::size_t cmp_n = std::min(emitted.size(), static_cast<std::size_t>(steps));
-        for (std::size_t i = 0; i < cmp_n; ++i) {
-            const int32_t ref = tokens[static_cast<std::size_t>(context) + 1u + i];
-            if (emitted[i] != ref) {
-                first_bad = static_cast<int>(i);
-                break;
+        std::printf("\n--- spec decode report (K=%lu) ---\n", draft_k);
+        std::printf("  rounds / updates       : %lld\n", rounds);
+        std::printf("  emitted tokens         : %zu\n", emitted.size());
+        std::printf("  accepted drafts        : %lld\n", accepted_total);
+        std::printf("  drafts generated       : %lld\n", drafts_total);
+        std::printf("  mean accepted/update   : %.3f\n",
+                    static_cast<double>(accepted_total) / rounds_d);
+        std::printf("  emitted/update         : %.3f\n",
+                    static_cast<double>(emitted.size()) / rounds_d);
+        std::printf("  reject0 rate           : %.1f%%\n", 100.0 * reject0 / rounds_d);
+        std::printf("  full accept rate       : %.1f%%\n", 100.0 * full_accepts / rounds_d);
+        std::printf("  target forward/update  : %.3f (%u forwards)\n",
+                    timing.target_forwards / rounds_d, timing.target_forwards);
+        std::printf("  reruns                 : %lld (%.1f%% of updates)\n",
+                    rerun_count, 100.0 * rerun_count / rounds_d);
+        std::printf("  single decode updates  : %lld\n", single_decodes);
+        std::printf("  draft ms/update        : %.3f\n", timing.draft_ms / rounds_d);
+        std::printf("  verify ms/update       : %.3f\n", timing.verify_ms / rounds_d);
+        std::printf("  gdn snapshot ms/update : %.3f\n", timing.gdn_snapshot_ms / rounds_d);
+        std::printf("  gdn restore ms/update  : %.3f\n", timing.gdn_restore_ms / rounds_d);
+        std::printf("  commit ms/update       : %.3f\n", timing.commit_ms / rounds_d);
+        std::printf("  decoder total ms       : %.3f\n", timing.total_ms);
+        if (emitted.size() > 0u) {
+            const double ms_per_token = wall_ms / emitted_d;
+            std::printf("  wall total             : %.3f ms\n", wall_ms);
+            std::printf("  total ms/token         : %.4f\n", ms_per_token);
+            std::printf("  tok/s                  : %.1f\n", 1000.0 * emitted_d / wall_ms);
+            std::printf("  plain decode           : %.3f ms/token -> speedup %.2fx\n",
+                        target_step_ms, target_step_ms / ms_per_token);
+        }
+
+        const bool complete = emitted.size() >= static_cast<std::size_t>(steps);
+        const bool match = complete && first_bad < 0 && contract_ok;
+        spec_ok = match;
+        std::printf("greedy equivalence: %s\n", match ? "PASS" : "FAIL");
+        if (!match) {
+            if (first_bad >= 0) {
+                const std::size_t idx = static_cast<std::size_t>(first_bad);
+                std::printf("  divergence index %d: got %d expected %d\n", first_bad,
+                            emitted[idx],
+                            tokens[static_cast<std::size_t>(context) + 1u + idx]);
+                std::printf("  pending_token       : %d\n", bad_diag.pending_before);
+                std::printf("  mtp logical_length  : before=%u after=%u\n",
+                            bad_diag.mtp_length_before, bad_diag.mtp_length_after);
+                std::printf("  sequence.position   : before=%u after=%u\n",
+                            bad_diag.seq_position_before, bad_diag.seq_position_after);
+                std::printf("  accepted=%u drafts=%u mtp_drafts=%u rerun=%d\n",
+                            bad_diag.accepted, bad_diag.drafts, bad_diag.mtp_drafts,
+                            bad_diag.rerun ? 1 : 0);
+                std::printf("  draft tokens        :");
+                for (int32_t t : bad_diag.draft_tokens) std::printf(" %d", t);
+                std::printf("\n  verify sampled      :");
+                for (int32_t t : bad_diag.verify_sampled) std::printf(" %d", t);
+                std::printf("\n  emitted this update :");
+                for (int32_t t : bad_diag.emitted_tokens) std::printf(" %d", t);
+                std::printf("\n");
+            }
+            if (!complete) {
+                std::printf("  emitted %zu of %lu expected tokens\n",
+                            emitted.size(), steps);
+            }
+            if (!contract_ok) {
+                std::printf("  MTP logical length contract violated\n");
             }
         }
-        std::printf("spec: %zu tokens in %lld rounds (reruns %lld, mean accept %.2f)\n",
-                    emitted.size(), rounds, reruns,
-                    static_cast<double>(sum_accept) / static_cast<double>(rounds));
-        std::printf("spec decode: %.3f ms/token   plain decode: %.3f ms/token   speedup %.2fx\n",
-                    spec_ms, target_step_ms, target_step_ms / spec_ms);
-        std::printf("greedy equivalence: %s", first_bad < 0 ? "PASS" : "FAIL");
-        if (first_bad >= 0) {
-            std::printf("  (diverges at emitted index %d: got %d expected %d)",
-                        first_bad, emitted[first_bad],
-                        tokens[static_cast<std::size_t>(context) + 1u + first_bad]);
-        }
-        std::printf("\n");
+        (void)ps::qwen35::runtime::spec_decoder_shutdown(decoder);
+        std::fflush(stdout);
     }
 
     ps::qwen35::runtime::mtp_executor_shutdown(mtp);
@@ -1151,5 +1273,5 @@ int run_mtp(int argc, char** argv) {
         return 1;
     }
     ps::gpu::discard_cleanup_result(hipStreamDestroy(stream));
-    return 0;
+    return spec_ok ? 0 : 1;
 }

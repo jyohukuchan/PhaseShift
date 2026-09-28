@@ -12,7 +12,8 @@
   MTP 1 層、`tie_word_embeddings=true`）
 
 production 経路は `SpecDecoder`（`spec_decoder_step`）で、その呼び出し元は
-現状 **tests のみ**。`phaseshift-cli` / `phaseshift-compute` に MTP の入口は無い。
+tests と `phaseshift-bench mtp --spec`。`phaseshift-cli` / `phaseshift-compute` に
+MTP の入口は無い。
 
 ---
 
@@ -40,6 +41,7 @@ production 経路は `SpecDecoder`（`spec_decoder_step`）で、その呼び出
   verify 本体が partial accept rerun であり M 非依存でないことが判明した
   （[optimization_history.md](optimization_history.md) §7.74）。
   §3.6 の「既定では lossless でない」は §7 の修正で解消した。
+  §3.6 の「bench harness の欠陥」は §8 の修正で解消した。
 
 ## Gate index
 
@@ -233,14 +235,16 @@ MTP head は 1 層自己回帰で、深さ 2 以降の入力が自分の出力�
 
 ### 3.6 production 入口が無い／周辺が古い
 
-- `create_spec_decoder` / `spec_decoder_step` の呼び出し元は tests のみ。
+- `create_spec_decoder` / `spec_decoder_step` の呼び出し元は tests と
+  `phaseshift-bench mtp --spec`。
 - `MtpDraftPolicy` の閾値は §7.76 の pending_hidden 修正**前**の calibration。
   修正後は static K1 が dynamic+discard を上回っており、既定 `dynamic=false`。
-- **bench harness の欠陥**:
-  - `src/apps/bench/mtp.hip` の `--spec`: MTP KV の prefill をせず
-    （`spec_mode` 相では `run_mtp_rows` を呼んでいない）、partial accept で
-    **GDN restore をしない**。→ K1 0.78x / `greedy equivalence: FAIL` はこれが原因。
-    同条件の `tg.hip` が accept 0.65 のところ mtp bench は 0.39 と食い違う。
+- **bench harness の欠陥（2026-09-29 に修正。経緯は §8）**:
+  - `src/apps/bench/mtp.hip` の `--spec` は独自の古い speculative decode loop を持ち、
+    MTP KV の prefill をせず（`spec_mode` 相では `run_mtp_rows` を呼んでいない）、
+    partial accept で **GDN restore をしなかった**。→ K1 0.78x /
+    `greedy equivalence: FAIL` の原因。同条件の `tg.hip` が accept 0.65 のところ
+    mtp bench は 0.39 と食い違った。修正後は production `SpecDecoder` を使う。
   - `test_qwen35_mtp_spec_perf`: arena を prompt ごとに bump 確保して解放しないため
     prompts=4 で K4 が `arena capacity exceeded` になる。
 
@@ -281,7 +285,8 @@ RoPE position は `accepted+1` で進むため all-accept のたびに slot が 
    参照実装の設計は `docs/references/spec_decode_loops.md`。
 3. **verify 幅の動的制御の再調整**（§3.6）。参照側の `RADIANCE_DYNAMIC_WIDTH` 相当。
 4. **production 化**: VERIFY_EXACT 相当の numeric mode を既定にし、CLI から有効化。
-5. **harness の修正**（§3.6）。1〜3 の効果を正しく測る前提。
+5. **harness の修正**（§3.6）→ 完了（§8）。1〜3 の効果は
+   `phaseshift-bench mtp --spec` で正しく測れる。
 
 ---
 
@@ -302,14 +307,22 @@ PHASESHIFT_MTP_PERF_PROMPTS=2 PHASESHIFT_VERIFY_EXACT=1 \
   --arena-gib 24 --context 256 --steps 32 --draft-k 8 \
   --tokens-file tests/data/mtp_perf/prose.psktok --chain pre
 
-# draft/verify/rerun を通した accept（GDN restore あり。正しい harness）
+# production SpecDecoder contract で draft / verify / accept（§8。既定 verify=Exact）
+./build/phaseshift-bench mtp --model-dir models/Qwen3.8-27B-PSQ --device 1 \
+  --arena-gib 24 --context 256 --steps 48 --draft-k 1 \
+  --tokens-file tests/data/mtp_perf/prose.psktok --spec --spec-only
+
+# draft/verify/rerun を通した accept（legacy。GDN restore あり）
 ./build/phaseshift-bench tg --model-dir models/Qwen3.8-27B-PSQ --device 1 \
   --context 256 --tokens 48 --tokens-file tests/data/mtp_perf/prose.psktok \
   --mode greedy --mtp --draft-k 4 --mtp-chain pre \
   --page-tokens 16 --arena-gib 24 --warmup 0 --device 1
 ```
 
-注意: `phaseshift-bench mtp --spec` は §3.6 のとおり計測に使えない。
+注意: `phaseshift-bench mtp --spec` は §8 以降 production `SpecDecoder` contract を
+使うので計測に使える。spec OFF / ON の token 完全一致が条件で、不一致なら
+終了コード非 0。`tg --mtp` は verify numeric mode を `Fast` のまま使うため
+27B-PSQ では greedy からずれる（§3.5 / §7.68）。
 `test_qwen35_mtp_spec_perf` は arena と state 使い回しの問題があり、
 K4/K8 を prompts 4 以上で回すと途中で落ちる。
 
@@ -374,6 +387,76 @@ K4/K8 を prompts 4 以上で回すと途中で落ちる。
 
 - pp2048: 863.79 ms（2370.95 tok/s）
 - tg ctx2048 tok32: 27.32 tok/s
+
+---
+
+## 8. 修正（2026-09-29）: `phaseshift-bench mtp --spec` を production SpecDecoder へ
+
+### 8.1 症状
+
+`phaseshift-bench mtp --spec` が `greedy equivalence: FAIL` となり、
+同条件の `tg --mtp` が accept 0.65 を出す箇所で 0.39 しか出なかった。
+harness が SpecDecoder を使わず、独自の古い speculative decode loop を持っていた。
+
+### 8.2 原因
+
+1. `--spec` の parse が `spec_mode = true; spec_only = true;` であり、
+   MTP prompt KV の teacher-force prefill が `if (!spec_only)` の中にあった。
+   そのため `--spec` では MTP prompt KV が構築されない。
+2. それでも最初の draft は `run_mtp_head(mtp, hid, in_tok, P + k, stream)` を呼び、
+   `prefix_length = context - 1` 相当を前提に attention していた
+   （重大な state contract 違反）。
+3. partial accept 時に `seq.position = P + 1` に戻すだけで、verify 前の
+   GDN recurrent / conv state を restore していなかった。正規 `SpecDecoder` は
+   `spec_gdn_snapshot` → verify → partial accept → `spec_gdn_restore` →
+   accepted prefix rerun を行う。
+4. `run_mtp_head(position)` ベースの loop は、
+   `mtp_forward_step` + `MtpKvState.logical_length` による
+   「logical KV index / absolute RoPE position の分離」を表現できない。
+   accept 後の MTP logical length は `before + min(accepted + 1, K)` であり、
+   absolute position と常に一致するわけではない。
+5. verify batch が `speculative_verify = true` と `verify_numeric_mode` を設定せず、
+   正規 `SpecDecoder` の Verify role / Exact numeric path を通っていなかった。
+
+### 8.3 修正
+
+- `src/apps/bench/mtp.hip` phase 4 を production `SpecDecoder` API へ置き換えた。
+  target prompt prefill → `mtp_kv_reset` → `spec_decoder_sync_prompt` →
+  `spec_decoder_step` のみで update を進める。harness 側の独自 draft / verify /
+  accept / `sequence.position` rollback は削除した。
+- `--spec` は phase 4 の有効化だけとし、legacy phase 2/3 の省略は
+  `--spec-only` が担うように分離した。phase 4 は phase 2 に依存しない。
+- `SpecIterationOutput` に `num_mtp_drafts` / `mtp_length_before` /
+  `mtp_length_after` / `rerun` / `draft_tokens` / `verify_sampled` を追加した。
+- `--spec-debug` を追加。prompt sync 直後の `logical_length == context - 1`、
+  draft 開始前の `logical_length` / absolute RoPE position / `sequence.position`、
+  draft 後の `kv_length_before` / `kv_length_after`、commit 後の
+  `logical_length == before + min(accepted + 1, num_mtp_drafts)` を assert / log する。
+  absolute position と logical KV index を等しいものとして assert しない。
+- `--verify-mode exact|fast`（既定 `Exact`）を追加。
+- spec OFF / ON の token 列完全一致を必須条件にした。不一致時は divergence index・
+  pending token・MTP `logical_length`・`sequence.position`・accepted 数・draft 列・
+  verify sample 列を表示し、終了コード非 0 で終了する。
+- `--chain pre|post` は legacy acceptance sim 専用とし、SpecDecoder 経路の
+  次 draft hidden は常に `hidden_out`（final norm 前）であることを出力する。
+
+### 8.4 検証（27B-PSQ、prose ctx256、TG48、device 1、`--spec --spec-only`）
+
+| K | greedy equivalence | rounds | emitted | accepted | mean accept/update | emitted/update | reject0 | full accept | rerun | draft ms/update | verify ms/update | ms/token | tok/s | speedup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | PASS | 31 | 49 | 18 | 0.581 | 1.581 | 41.9% | 58.1% | 41.9% | 4.47 | 51.10 | 35.16 | 28.4 | 1.02x |
+| 2 | PASS | 26 | 49 | 23 | 0.885 | 1.885 | 50.0% | 38.5% | 61.5% | 8.29 | 59.22 | 35.83 | 27.9 | 1.00x |
+| 4 | PASS | 24 | 49 | 25 | 1.042 | 2.042 | 50.0% | 4.2% | 95.8% | 15.88 | 73.66 | 43.86 | 22.8 | 0.82x |
+| 8 | PASS | 24 | 49 | 25 | 1.042 | 2.042 | 50.0% | 0.0% | 100.0% | 31.01 | 78.53 | 53.66 | 18.6 | 0.67x |
+
+- target forward/update は K1 1.419 / K2 1.615 / K4 1.958 / K8 2.000。
+  同条件の target-only greedy は 36.0 ms/token。
+- `--verify-mode fast` にすると greedy equivalence が FAIL し、
+  `tg --mtp` と同一の token 列・同一の rounds / reruns / accept
+  （29 / 10 / 0.655 対 29 / 10 / 0.66）を示す。
+  つまり `tg --mtp` の greedy からのずれは state ではなく verify の
+  numeric mode に由来する。
+- required acceptance と MTP required 合成テストは変更前後で PASS。
 
 ---
 
